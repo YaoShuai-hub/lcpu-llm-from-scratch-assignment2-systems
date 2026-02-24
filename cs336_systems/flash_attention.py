@@ -203,7 +203,7 @@ try:
 
         # Load Q block, mask out-of-bounds
         q_mask = (q_offs[:, None] < n_q) & (d_range[None, :] < d)
-        qi = tl.load(Q_block_ptr, mask=q_mask, other=0.0)  # (BLOCK_Q, BLOCK_K)
+        qi = tl.load(Q_block_ptr, mask=q_mask, other=0.0).to(tl.float32)  # (BLOCK_Q, BLOCK_K)
         qi = qi * scale
 
         # Running stats
@@ -220,8 +220,8 @@ try:
             V_block_ptr = V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd
 
             kv_mask = (k_offs[:, None] < n_k) & (d_range[None, :] < d)
-            kj = tl.load(K_block_ptr, mask=kv_mask, other=0.0)  # (BLOCK_K, BLOCK_K) — actually (bc, d)
-            vj = tl.load(V_block_ptr, mask=kv_mask, other=0.0)
+            kj = tl.load(K_block_ptr, mask=kv_mask, other=0.0).to(tl.float32)
+            vj = tl.load(V_block_ptr, mask=kv_mask, other=0.0).to(tl.float32)
 
             # S_ij = qi @ kj.T  [BLOCK_Q, BLOCK_K]
             sij = tl.dot(qi, tl.trans(kj))  # (BLOCK_Q, BLOCK_K)
@@ -245,7 +245,7 @@ try:
             exp_mij = tl.exp(mij - mi_new)
 
             li = exp_mi * li + exp_mij * lij
-            oi = exp_mi[:, None] * oi + exp_mij[:, None] * tl.dot(pij.to(tl.float32), vj.to(tl.float32))
+            oi = exp_mi[:, None] * oi + exp_mij[:, None] * tl.dot(pij, vj)
             mi = mi_new
 
         # Normalize
@@ -254,7 +254,7 @@ try:
         # Write output
         O_block_ptr = O_ptr + pid_b * stride_ob + q_offs[:, None] * stride_on + d_range[None, :] * stride_od
         o_mask = (q_offs[:, None] < n_q) & (d_range[None, :] < d)
-        tl.store(O_block_ptr, oi.to(tl.float16), mask=o_mask)
+        tl.store(O_block_ptr, oi, mask=o_mask)
 
         # Write L = mi + log(li)
         L_val = mi + tl.log(li)
@@ -287,10 +287,10 @@ try:
         k_offs = k_start + tl.arange(0, BLOCK_K)
         d_range = tl.arange(0, BLOCK_K)
 
-        # Load K and V blocks
+        # Load K and V blocks (cast to fp32 for computation)
         KV_mask = (k_offs[:, None] < n_k) & (d_range[None, :] < d)
-        kj = tl.load(K_ptr + pid_b * stride_kb + k_offs[:, None] * stride_kn + d_range[None, :] * stride_kd, mask=KV_mask, other=0.0)
-        vj = tl.load(V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd, mask=KV_mask, other=0.0)
+        kj = tl.load(K_ptr + pid_b * stride_kb + k_offs[:, None] * stride_kn + d_range[None, :] * stride_kd, mask=KV_mask, other=0.0).to(tl.float32)
+        vj = tl.load(V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd, mask=KV_mask, other=0.0).to(tl.float32)
 
         dkj = tl.zeros([BLOCK_K, BLOCK_K], dtype=tl.float32)
         dvj = tl.zeros([BLOCK_K, BLOCK_K], dtype=tl.float32)
@@ -300,10 +300,10 @@ try:
             q_offs = q_start + tl.arange(0, BLOCK_Q)
             Q_mask = (q_offs[:, None] < n_q) & (d_range[None, :] < d)
 
-            qi = tl.load(Q_ptr + pid_b * stride_qb + q_offs[:, None] * stride_qn + d_range[None, :] * stride_qd, mask=Q_mask, other=0.0)
-            oi = tl.load(O_ptr + pid_b * stride_ob + q_offs[:, None] * stride_on + d_range[None, :] * stride_od, mask=Q_mask, other=0.0)
-            doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0)
-            li = tl.load(L_ptr + pid_b * stride_lb + q_offs * stride_ln, mask=q_offs < n_q, other=0.0)  # (BLOCK_Q,)
+            qi  = tl.load(Q_ptr  + pid_b * stride_qb  + q_offs[:, None] * stride_qn  + d_range[None, :] * stride_qd,  mask=Q_mask, other=0.0).to(tl.float32)
+            oi  = tl.load(O_ptr  + pid_b * stride_ob  + q_offs[:, None] * stride_on  + d_range[None, :] * stride_od,  mask=Q_mask, other=0.0).to(tl.float32)
+            doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0).to(tl.float32)
+            li  = tl.load(L_ptr  + pid_b * stride_lb  + q_offs * stride_ln, mask=q_offs < n_q, other=0.0)  # (BLOCK_Q,)
 
             # S = qi @ kj.T * scale
             sij = tl.dot(qi, tl.trans(kj)) * scale  # (BLOCK_Q, BLOCK_K)
@@ -316,19 +316,19 @@ try:
             pij = tl.exp(sij - li[:, None])  # (BLOCK_Q, BLOCK_K)
 
             # dV += P^T @ dO
-            dvj += tl.dot(tl.trans(pij), doi.to(tl.float32))
+            dvj += tl.dot(tl.trans(pij), doi)
 
             # dP = dO @ V^T
-            dpij = tl.dot(doi.to(tl.float32), tl.trans(vj.to(tl.float32)))  # (BLOCK_Q, BLOCK_K)
+            dpij = tl.dot(doi, tl.trans(vj))  # (BLOCK_Q, BLOCK_K)
 
             # Di = rowsum(dO * O)
-            Di = tl.sum(doi.to(tl.float32) * oi.to(tl.float32), axis=1)  # (BLOCK_Q,)
+            Di = tl.sum(doi * oi, axis=1)  # (BLOCK_Q,)
 
             # dS = P * (dP - Di)
             dsij = pij * (dpij - Di[:, None]) * scale  # (BLOCK_Q, BLOCK_K)
 
             # dK += dS^T @ Q
-            dkj += tl.dot(tl.trans(dsij), qi.to(tl.float32))
+            dkj += tl.dot(tl.trans(dsij), qi)
 
         # Write back dK, dV
         dK_block_ptr = dK_ptr + pid_b * stride_dkb + k_offs[:, None] * stride_dkn + d_range[None, :] * stride_dkd
@@ -360,20 +360,20 @@ try:
         d_range = tl.arange(0, BLOCK_K)
 
         Q_mask = (q_offs[:, None] < n_q) & (d_range[None, :] < d)
-        qi = tl.load(Q_ptr + pid_b * stride_qb + q_offs[:, None] * stride_qn + d_range[None, :] * stride_qd, mask=Q_mask, other=0.0)
-        oi = tl.load(O_ptr + pid_b * stride_ob + q_offs[:, None] * stride_on + d_range[None, :] * stride_od, mask=Q_mask, other=0.0)
-        doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0)
-        li = tl.load(L_ptr + pid_b * stride_lb + q_offs * stride_ln, mask=q_offs < n_q, other=0.0)
+        qi  = tl.load(Q_ptr  + pid_b * stride_qb  + q_offs[:, None] * stride_qn  + d_range[None, :] * stride_qd,  mask=Q_mask, other=0.0).to(tl.float32)
+        oi  = tl.load(O_ptr  + pid_b * stride_ob  + q_offs[:, None] * stride_on  + d_range[None, :] * stride_od,  mask=Q_mask, other=0.0).to(tl.float32)
+        doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0).to(tl.float32)
+        li  = tl.load(L_ptr  + pid_b * stride_lb  + q_offs * stride_ln, mask=q_offs < n_q, other=0.0)
 
         dqi = tl.zeros([BLOCK_Q, BLOCK_K], dtype=tl.float32)
-        Di = tl.sum(doi.to(tl.float32) * oi.to(tl.float32), axis=1)  # (BLOCK_Q,)
+        Di = tl.sum(doi * oi, axis=1)  # (BLOCK_Q,)
 
         for j in tl.range(0, tl.cdiv(n_k, BLOCK_K)):
             k_start = j * BLOCK_K
             k_offs = k_start + tl.arange(0, BLOCK_K)
             KV_mask = (k_offs[:, None] < n_k) & (d_range[None, :] < d)
-            kj = tl.load(K_ptr + pid_b * stride_kb + k_offs[:, None] * stride_kn + d_range[None, :] * stride_kd, mask=KV_mask, other=0.0)
-            vj = tl.load(V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd, mask=KV_mask, other=0.0)
+            kj = tl.load(K_ptr + pid_b * stride_kb + k_offs[:, None] * stride_kn + d_range[None, :] * stride_kd, mask=KV_mask, other=0.0).to(tl.float32)
+            vj = tl.load(V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd, mask=KV_mask, other=0.0).to(tl.float32)
 
             sij = tl.dot(qi, tl.trans(kj)) * scale
             k_valid = k_offs[None, :] < n_k
@@ -384,10 +384,10 @@ try:
 
             pij = tl.exp(sij - li[:, None])
 
-            dpij = tl.dot(doi.to(tl.float32), tl.trans(vj.to(tl.float32)))
+            dpij = tl.dot(doi, tl.trans(vj))
             dsij = pij * (dpij - Di[:, None]) * scale
 
-            dqi += tl.dot(dsij.to(tl.float32), kj.to(tl.float32))
+            dqi += tl.dot(dsij, kj)
 
         dQ_block_ptr = dQ_ptr + pid_b * stride_dqb + q_offs[:, None] * stride_dqn + d_range[None, :] * stride_dqd
         tl.store(dQ_block_ptr, dqi, mask=Q_mask)
@@ -402,21 +402,21 @@ try:
         BLOCK_K = max(16, min(64, triton.next_power_of_2(d)))
         BLOCK_Q = BLOCK_K  # square blocks
 
-        # Allocate output tensors (float16 for performance, then cast)
+        # Allocate output tensors (fp32, same as inputs)
         O = torch.empty_like(q)
         L = torch.empty((batch, n_q), device=q.device, dtype=torch.float32)
 
-        # Convert to float16 for Triton processing if not already
-        q16 = q.to(torch.float16)
-        k16 = k.to(torch.float16)
-        v16 = v.to(torch.float16)
+        # Keep fp32 — kernels cast internally
+        qf = q.contiguous()
+        kf = k.contiguous()
+        vf = v.contiguous()
 
         grid = (batch, triton.cdiv(n_q, BLOCK_Q))
         _flash_fwd_kernel[grid](
-            q16, k16, v16, O, L,
-            q16.stride(0), q16.stride(1), q16.stride(2),
-            k16.stride(0), k16.stride(1), k16.stride(2),
-            v16.stride(0), v16.stride(1), v16.stride(2),
+            qf, kf, vf, O, L,
+            qf.stride(0), qf.stride(1), qf.stride(2),
+            kf.stride(0), kf.stride(1), kf.stride(2),
+            vf.stride(0), vf.stride(1), vf.stride(2),
             O.stride(0), O.stride(1), O.stride(2),
             L.stride(0), L.stride(1),
             n_q, n_k, d, scale,
@@ -424,7 +424,7 @@ try:
             BLOCK_Q=BLOCK_Q,
             BLOCK_K=BLOCK_K,
         )
-        return O.to(q.dtype), L
+        return O, L
 
     def _flash_bwd_triton(q, k, v, O, L, dO, is_causal):
         """Launch Triton backward kernels."""
@@ -439,26 +439,27 @@ try:
         dK = torch.zeros_like(k, dtype=torch.float32)
         dV = torch.zeros_like(v, dtype=torch.float32)
 
-        q16 = q.to(torch.float16)
-        k16 = k.to(torch.float16)
-        v16 = v.to(torch.float16)
-        O16 = O.to(torch.float16)
-        dO16 = dO.to(torch.float16)
+        # Keep fp32 — kernels cast internally
+        qf  = q.contiguous()
+        kf  = k.contiguous()
+        vf  = v.contiguous()
+        Of  = O.contiguous()
+        dOf = dO.contiguous()
 
         # Compute dK, dV
         grid_k = (batch, triton.cdiv(n_k, BLOCK_K))
         _flash_bwd_kernel[grid_k](
-            q16, k16, v16, O16, L, dO16,
+            qf, kf, vf, Of, L, dOf,
             dQ, dK, dV,
-            q16.stride(0), q16.stride(1), q16.stride(2),
-            k16.stride(0), k16.stride(1), k16.stride(2),
-            v16.stride(0), v16.stride(1), v16.stride(2),
-            O16.stride(0), O16.stride(1), O16.stride(2),
-            L.stride(0), L.stride(1),
-            dO16.stride(0), dO16.stride(1), dO16.stride(2),
-            dQ.stride(0), dQ.stride(1), dQ.stride(2),
-            dK.stride(0), dK.stride(1), dK.stride(2),
-            dV.stride(0), dV.stride(1), dV.stride(2),
+            qf.stride(0),  qf.stride(1),  qf.stride(2),
+            kf.stride(0),  kf.stride(1),  kf.stride(2),
+            vf.stride(0),  vf.stride(1),  vf.stride(2),
+            Of.stride(0),  Of.stride(1),  Of.stride(2),
+            L.stride(0),   L.stride(1),
+            dOf.stride(0), dOf.stride(1), dOf.stride(2),
+            dQ.stride(0),  dQ.stride(1),  dQ.stride(2),
+            dK.stride(0),  dK.stride(1),  dK.stride(2),
+            dV.stride(0),  dV.stride(1),  dV.stride(2),
             n_q, n_k, d, scale,
             IS_CAUSAL=is_causal,
             BLOCK_Q=BLOCK_Q,
@@ -468,14 +469,14 @@ try:
         # Compute dQ
         grid_q = (batch, triton.cdiv(n_q, BLOCK_Q))
         _flash_bwd_dq_kernel[grid_q](
-            q16, k16, v16, O16, L, dO16, dQ,
-            q16.stride(0), q16.stride(1), q16.stride(2),
-            k16.stride(0), k16.stride(1), k16.stride(2),
-            v16.stride(0), v16.stride(1), v16.stride(2),
-            O16.stride(0), O16.stride(1), O16.stride(2),
-            L.stride(0), L.stride(1),
-            dO16.stride(0), dO16.stride(1), dO16.stride(2),
-            dQ.stride(0), dQ.stride(1), dQ.stride(2),
+            qf, kf, vf, Of, L, dOf, dQ,
+            qf.stride(0),  qf.stride(1),  qf.stride(2),
+            kf.stride(0),  kf.stride(1),  kf.stride(2),
+            vf.stride(0),  vf.stride(1),  vf.stride(2),
+            Of.stride(0),  Of.stride(1),  Of.stride(2),
+            L.stride(0),   L.stride(1),
+            dOf.stride(0), dOf.stride(1), dOf.stride(2),
+            dQ.stride(0),  dQ.stride(1),  dQ.stride(2),
             n_q, n_k, d, scale,
             IS_CAUSAL=is_causal,
             BLOCK_Q=BLOCK_Q,
