@@ -280,56 +280,61 @@ try:
         IS_CAUSAL: tl.constexpr,
         BLOCK_Q: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
     ):
-        """Triton kernel for FlashAttention2 backward pass - computes dK and dV for a K-block."""
+        """Triton kernel for FlashAttention2 backward pass - computes dK and dV for a K-block.
+
+        BLOCK_K/BLOCK_Q: sequence-dimension tile size (kept small to limit shared memory).
+        BLOCK_D: head-dimension tile size (= next_power_of_2(d), must cover full head dim).
+        """
         pid_b = tl.program_id(0)
         pid_k = tl.program_id(1)
 
         k_start = pid_k * BLOCK_K
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        d_range = tl.arange(0, BLOCK_K)
+        k_offs = k_start + tl.arange(0, BLOCK_K)   # K sequence positions
+        d_range = tl.arange(0, BLOCK_D)             # head dimension indices
 
-        # Load K and V blocks (cast to fp32 for computation)
+        # Load K[pid_k] and V[pid_k]: shape [BLOCK_K, BLOCK_D]
         KV_mask = (k_offs[:, None] < n_k) & (d_range[None, :] < d)
         kj = tl.load(K_ptr + pid_b * stride_kb + k_offs[:, None] * stride_kn + d_range[None, :] * stride_kd, mask=KV_mask, other=0.0).to(tl.float32)
         vj = tl.load(V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd, mask=KV_mask, other=0.0).to(tl.float32)
 
-        dkj = tl.zeros([BLOCK_K, BLOCK_K], dtype=tl.float32)
-        dvj = tl.zeros([BLOCK_K, BLOCK_K], dtype=tl.float32)
+        dkj = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)  # (BLOCK_K, BLOCK_D)
+        dvj = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)  # (BLOCK_K, BLOCK_D)
 
         for i in tl.range(0, tl.cdiv(n_q, BLOCK_Q)):
             q_start = i * BLOCK_Q
             q_offs = q_start + tl.arange(0, BLOCK_Q)
             Q_mask = (q_offs[:, None] < n_q) & (d_range[None, :] < d)
 
-            qi  = tl.load(Q_ptr  + pid_b * stride_qb  + q_offs[:, None] * stride_qn  + d_range[None, :] * stride_qd,  mask=Q_mask, other=0.0).to(tl.float32)
+            qi  = tl.load(Q_ptr  + pid_b * stride_qb  + q_offs[:, None] * stride_qn  + d_range[None, :] * stride_qd,  mask=Q_mask, other=0.0).to(tl.float32)  # [BLOCK_Q, BLOCK_D]
             oi  = tl.load(O_ptr  + pid_b * stride_ob  + q_offs[:, None] * stride_on  + d_range[None, :] * stride_od,  mask=Q_mask, other=0.0).to(tl.float32)
-            doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0).to(tl.float32)
+            doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0).to(tl.float32)  # [BLOCK_Q, BLOCK_D]
             li  = tl.load(L_ptr  + pid_b * stride_lb  + q_offs * stride_ln, mask=q_offs < n_q, other=0.0)  # (BLOCK_Q,)
 
-            # S = qi @ kj.T * scale
-            sij = tl.dot(qi, tl.trans(kj)) * scale  # (BLOCK_Q, BLOCK_K)
+            # S = (qi @ kj.T) * scale  →  [BLOCK_Q, BLOCK_K]
+            sij = tl.dot(qi, tl.trans(kj)) * scale
             k_valid = k_offs[None, :] < n_k
             sij = tl.where(k_valid, sij, float("-inf"))
             if IS_CAUSAL:
                 causal_mask = q_offs[:, None] >= k_offs[None, :]
                 sij = tl.where(causal_mask, sij, float("-inf"))
 
-            pij = tl.exp(sij - li[:, None])  # (BLOCK_Q, BLOCK_K)
+            pij = tl.exp(sij - li[:, None])  # [BLOCK_Q, BLOCK_K]
 
-            # dV += P^T @ dO
+            # dV += P^T @ dO  →  [BLOCK_K, BLOCK_D]
             dvj += tl.dot(tl.trans(pij), doi)
 
-            # dP = dO @ V^T
-            dpij = tl.dot(doi, tl.trans(vj))  # (BLOCK_Q, BLOCK_K)
+            # dP = dO @ V^T  →  [BLOCK_Q, BLOCK_K]
+            dpij = tl.dot(doi, tl.trans(vj))
 
-            # Di = rowsum(dO * O)
-            Di = tl.sum(doi * oi, axis=1)  # (BLOCK_Q,)
+            # Di = rowsum(dO * O)  →  [BLOCK_Q]
+            Di = tl.sum(doi * oi, axis=1)
 
-            # dS = P * (dP - Di)
-            dsij = pij * (dpij - Di[:, None]) * scale  # (BLOCK_Q, BLOCK_K)
+            # dS = P * (dP - Di) * scale  →  [BLOCK_Q, BLOCK_K]
+            dsij = pij * (dpij - Di[:, None]) * scale
 
-            # dK += dS^T @ Q
+            # dK += dS^T @ Q  →  [BLOCK_K, BLOCK_D]
             dkj += tl.dot(tl.trans(dsij), qi)
 
         # Write back dK, dV
@@ -352,31 +357,37 @@ try:
         IS_CAUSAL: tl.constexpr,
         BLOCK_Q: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
     ):
-        """Triton kernel to compute dQ for a Q-block."""
+        """Triton kernel to compute dQ for a Q-block.
+
+        BLOCK_Q/BLOCK_K: sequence-dimension tile sizes.
+        BLOCK_D: head-dimension tile size (= next_power_of_2(d)).
+        """
         pid_b = tl.program_id(0)
         pid_q = tl.program_id(1)
 
         q_start = pid_q * BLOCK_Q
         q_offs = q_start + tl.arange(0, BLOCK_Q)
-        d_range = tl.arange(0, BLOCK_K)
+        d_range = tl.arange(0, BLOCK_D)  # head dimension
 
         Q_mask = (q_offs[:, None] < n_q) & (d_range[None, :] < d)
-        qi  = tl.load(Q_ptr  + pid_b * stride_qb  + q_offs[:, None] * stride_qn  + d_range[None, :] * stride_qd,  mask=Q_mask, other=0.0).to(tl.float32)
+        qi  = tl.load(Q_ptr  + pid_b * stride_qb  + q_offs[:, None] * stride_qn  + d_range[None, :] * stride_qd,  mask=Q_mask, other=0.0).to(tl.float32)  # [BLOCK_Q, BLOCK_D]
         oi  = tl.load(O_ptr  + pid_b * stride_ob  + q_offs[:, None] * stride_on  + d_range[None, :] * stride_od,  mask=Q_mask, other=0.0).to(tl.float32)
-        doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0).to(tl.float32)
+        doi = tl.load(dO_ptr + pid_b * stride_dob + q_offs[:, None] * stride_don + d_range[None, :] * stride_dod, mask=Q_mask, other=0.0).to(tl.float32)  # [BLOCK_Q, BLOCK_D]
         li  = tl.load(L_ptr  + pid_b * stride_lb  + q_offs * stride_ln, mask=q_offs < n_q, other=0.0)
 
-        dqi = tl.zeros([BLOCK_Q, BLOCK_K], dtype=tl.float32)
+        dqi = tl.zeros([BLOCK_Q, BLOCK_D], dtype=tl.float32)  # [BLOCK_Q, BLOCK_D]
         Di = tl.sum(doi * oi, axis=1)  # (BLOCK_Q,)
 
         for j in tl.range(0, tl.cdiv(n_k, BLOCK_K)):
             k_start = j * BLOCK_K
             k_offs = k_start + tl.arange(0, BLOCK_K)
             KV_mask = (k_offs[:, None] < n_k) & (d_range[None, :] < d)
-            kj = tl.load(K_ptr + pid_b * stride_kb + k_offs[:, None] * stride_kn + d_range[None, :] * stride_kd, mask=KV_mask, other=0.0).to(tl.float32)
-            vj = tl.load(V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd, mask=KV_mask, other=0.0).to(tl.float32)
+            kj = tl.load(K_ptr + pid_b * stride_kb + k_offs[:, None] * stride_kn + d_range[None, :] * stride_kd, mask=KV_mask, other=0.0).to(tl.float32)  # [BLOCK_K, BLOCK_D]
+            vj = tl.load(V_ptr + pid_b * stride_vb + k_offs[:, None] * stride_vn + d_range[None, :] * stride_vd, mask=KV_mask, other=0.0).to(tl.float32)  # [BLOCK_K, BLOCK_D]
 
+            # S = (qi @ kj.T) * scale  →  [BLOCK_Q, BLOCK_K]
             sij = tl.dot(qi, tl.trans(kj)) * scale
             k_valid = k_offs[None, :] < n_k
             sij = tl.where(k_valid, sij, float("-inf"))
@@ -384,11 +395,14 @@ try:
                 causal_mask = q_offs[:, None] >= k_offs[None, :]
                 sij = tl.where(causal_mask, sij, float("-inf"))
 
-            pij = tl.exp(sij - li[:, None])
+            pij = tl.exp(sij - li[:, None])  # [BLOCK_Q, BLOCK_K]
 
+            # dP = dO @ V^T  →  [BLOCK_Q, BLOCK_K]
             dpij = tl.dot(doi, tl.trans(vj))
+            # dS = P * (dP - Di) * scale  →  [BLOCK_Q, BLOCK_K]
             dsij = pij * (dpij - Di[:, None]) * scale
 
+            # dQ += dS @ K  →  [BLOCK_Q, BLOCK_D]
             dqi += tl.dot(dsij, kj)
 
         dQ_block_ptr = dQ_ptr + pid_b * stride_dqb + q_offs[:, None] * stride_dqn + d_range[None, :] * stride_dqd
@@ -434,10 +448,12 @@ try:
         n_k = k.shape[1]
         scale = float(d ** -0.5)
 
-        # Use smaller blocks for backward to stay within shared memory limits
-        # (e.g. GTX 1080 Ti has 96KB smem; BLOCK_K=64 would require ~128KB)
+        # Use smaller sequence blocks for backward to stay within shared memory limits
+        # (e.g. GTX 1080 Ti has ~96KB smem; BLOCK_K=64 would require ~128KB)
         BLOCK_K = max(16, min(32, triton.next_power_of_2(d)))
         BLOCK_Q = BLOCK_K
+        # Head dimension must always cover full d — kept separate from sequence block size
+        BLOCK_D = max(16, triton.next_power_of_2(d))
 
         dQ = torch.zeros_like(q, dtype=torch.float32)
         dK = torch.zeros_like(k, dtype=torch.float32)
@@ -468,6 +484,7 @@ try:
             IS_CAUSAL=is_causal,
             BLOCK_Q=BLOCK_Q,
             BLOCK_K=BLOCK_K,
+            BLOCK_D=BLOCK_D,
         )
 
         # Compute dQ
@@ -485,6 +502,7 @@ try:
             IS_CAUSAL=is_causal,
             BLOCK_Q=BLOCK_Q,
             BLOCK_K=BLOCK_K,
+            BLOCK_D=BLOCK_D,
         )
 
         return dQ.to(q.dtype), dK.to(k.dtype), dV.to(v.dtype)
