@@ -237,6 +237,8 @@ try:
 
             # Row max
             mij = tl.max(sij, axis=1)  # (BLOCK_Q,)
+            # Guard: when entire row is -inf (all keys masked), mij=-inf causes nan in exp
+            mij = tl.where(mij == float("-inf"), tl.zeros_like(mij), mij)
             pij = tl.exp(sij - mij[:, None])  # (BLOCK_Q, BLOCK_K)
             lij = tl.sum(pij, axis=1)  # (BLOCK_Q,)
 
@@ -432,7 +434,9 @@ try:
         n_k = k.shape[1]
         scale = float(d ** -0.5)
 
-        BLOCK_K = max(16, min(64, triton.next_power_of_2(d)))
+        # Use smaller blocks for backward to stay within shared memory limits
+        # (e.g. GTX 1080 Ti has 96KB smem; BLOCK_K=64 would require ~128KB)
+        BLOCK_K = max(16, min(32, triton.next_power_of_2(d)))
         BLOCK_Q = BLOCK_K
 
         dQ = torch.zeros_like(q, dtype=torch.float32)
