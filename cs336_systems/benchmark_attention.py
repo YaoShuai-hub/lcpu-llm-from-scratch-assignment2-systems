@@ -143,6 +143,7 @@ def find_oom_threshold(device: torch.device) -> None:
         try:
             torch.cuda.empty_cache()
             gc.collect()
+            torch.cuda.reset_peak_memory_stats(device)
             mha = build_mha(max_seq=seq_len, device=device)
             x = make_input(seq_len, device)
             out = mha(x)

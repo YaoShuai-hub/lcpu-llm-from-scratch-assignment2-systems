@@ -105,14 +105,15 @@ def run_memory_snapshot(
     output_file: str | None = None,
 ) -> None:
     """
-    Records a PyTorch memory snapshot during a single forward (or forward+backward)
-    pass of the 2.7B model.
+    Records a PyTorch memory snapshot during a single forward (or full training)
+    step of the 2.7B model.
 
     Visualize the resulting .pickle file at: https://pytorch.org/memory_viz
     """
     cfg = {**MODEL_2_7B, "context_length": context_length}
     print(f"Building 2.7B model (context_length={context_length})...")
     model = BasicsTransformerLM(**cfg).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-4) if include_backward else None
 
     x = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, context_length), device=device)
 
@@ -120,8 +121,12 @@ def run_memory_snapshot(
     for _ in range(2):
         logits = model(x)
         if include_backward:
-            logits.sum().backward()
-        model.zero_grad(set_to_none=True)
+            loss = logits.sum()
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            model.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
@@ -130,11 +135,19 @@ def run_memory_snapshot(
     torch.cuda.memory._record_memory_history(max_entries=100_000)
 
     # ── Profiled step ──────────────────────────────────────────────────────
-    model.zero_grad(set_to_none=True)
+    if include_backward:
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        model.zero_grad(set_to_none=True)
+
     logits = model(x)
+
     if include_backward:
         loss = logits.sum()
         loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
     torch.cuda.synchronize()
 
     # Dump snapshot

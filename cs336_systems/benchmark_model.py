@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import statistics
 import time
 
@@ -71,7 +72,7 @@ NUM_ITERS = 10
 # Helpers
 # ---------------------------------------------------------------------------
 
-def build_model(cfg: dict, device: torch.device) -> BasicsTransformerLM:
+def build_model(cfg: dict, device: torch.device, dtype: torch.dtype = torch.float32) -> BasicsTransformerLM:
     model = BasicsTransformerLM(
         vocab_size=VOCAB_SIZE,
         context_length=CONTEXT_LENGTH,
@@ -81,7 +82,7 @@ def build_model(cfg: dict, device: torch.device) -> BasicsTransformerLM:
         d_ff=cfg["d_ff"],
         rope_theta=ROPE_THETA,
     )
-    return model.to(device)
+    return model.to(device=device, dtype=dtype)
 
 
 def make_inputs(device: torch.device) -> torch.Tensor:
@@ -124,8 +125,9 @@ def benchmark(
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        with autocast_ctx:
-            logits = model(x)
+        with torch.no_grad():
+            with autocast_ctx:
+                logits = model(x)
         if device.type == "cuda":
             torch.cuda.synchronize()
         fwd_times.append((time.perf_counter() - t0) * 1e3)
@@ -233,7 +235,11 @@ def main() -> None:
                         help="Which model sizes to benchmark")
     parser.add_argument("--fp-demo", action="store_true",
                         help="Run the floating-point accumulation precision demo")
+    parser.add_argument("--model-dtype", choices=["fp32", "bf16"], default="fp32",
+                        help="Parameter dtype for model weights (bf16 reduces memory for large models)")
     args = parser.parse_args()
+
+    model_dtype = torch.float32 if args.model_dtype == "fp32" else torch.bfloat16
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -247,14 +253,15 @@ def main() -> None:
     print("=" * 60)
     print("Task 1 — Model benchmarking (forward + backward)")
     print(f"  batch={BATCH_SIZE}, context_length={CONTEXT_LENGTH}, "
-          f"vocab={VOCAB_SIZE}, warmup={NUM_WARMUP}, iters={NUM_ITERS}")
+            f"vocab={VOCAB_SIZE}, warmup={NUM_WARMUP}, iters={NUM_ITERS}, model_dtype={args.model_dtype}")
     print("=" * 60)
 
     for model_name in args.models:
         cfg = MODEL_CONFIGS[model_name]
         print(f"Building model '{model_name}' ...")
+        model = None
         try:
-            model = build_model(cfg, device)
+            model = build_model(cfg, device, dtype=model_dtype)
             n_params = sum(p.numel() for p in model.parameters()) / 1e6
             print(f"  Parameters: {n_params:.1f}M")
 
@@ -271,7 +278,12 @@ def main() -> None:
 
         except torch.cuda.OutOfMemoryError:
             print(f"  !! OOM for model '{model_name}' — skipping\n")
-            torch.cuda.empty_cache()
+        finally:
+            if model is not None:
+                del model
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     print("Done.")
 

@@ -1,0 +1,118 @@
+{
+  "distributed_communication_single_node": [
+    {
+      "backend": "gloo",
+      "world_size": 2,
+      "size_mb": 1,
+      "avg_ms": 1.1958394170505926
+    },
+    {
+      "backend": "gloo",
+      "world_size": 2,
+      "size_mb": 100,
+      "avg_ms": 39.240669250527084
+    },
+    {
+      "backend": "gloo",
+      "world_size": 2,
+      "size_mb": 1024,
+      "avg_ms": 497.313746168705
+    },
+    {
+      "backend": "gloo",
+      "world_size": 4,
+      "size_mb": 1,
+      "avg_ms": 2.411197667242959
+    },
+    {
+      "backend": "gloo",
+      "world_size": 4,
+      "size_mb": 100,
+      "avg_ms": 83.31415108356548
+    },
+    {
+      "backend": "gloo",
+      "world_size": 4,
+      "size_mb": 1024,
+      "avg_ms": 938.3685409169024
+    },
+    {
+      "backend": "nccl",
+      "world_size": 2,
+      "size_mb": 1,
+      "avg_ms": 0.05989333294564858
+    },
+    {
+      "backend": "nccl",
+      "world_size": 2,
+      "size_mb": 100,
+      "avg_ms": 3.3106931684111864
+    },
+    {
+      "backend": "nccl",
+      "world_size": 2,
+      "size_mb": 1024,
+      "avg_ms": 31.8903612496797
+    }
+  ],
+  "naive_ddp_benchmarking_vs_flat": {
+    "world_size": 2,
+    "naive_ms": 63.18726116539134,
+    "flat_ms": 2.1598878326282525
+  },
+  "ddp_overlap_individual_parameters_benchmarking": {
+    "world_size": 2,
+    "serial_ms": 6.021456666834031,
+    "overlap_ms": 4.395644835312851
+  },
+  "ddp_bucketed_benchmarking": [
+    {
+      "bucket_size_mb": 1,
+      "avg_ms": 4.515076332609169
+    },
+    {
+      "bucket_size_mb": 5,
+      "avg_ms": 4.710871333372779
+    },
+    {
+      "bucket_size_mb": 10,
+      "avg_ms": 4.599124833475798
+    },
+    {
+      "bucket_size_mb": 25,
+      "avg_ms": 4.946847999235615
+    },
+    {
+      "bucket_size_mb": 50,
+      "avg_ms": 5.654372667777352
+    },
+    {
+      "bucket_size_mb": 100,
+      "avg_ms": 5.841662166252111
+    },
+    {
+      "bucket_size_mb": 500,
+      "avg_ms": 5.516168501344509
+    }
+  ],
+  "optimizer_state_sharding_accounting": [
+    {
+      "rank": 0,
+      "full_step_ms": 5.024350166320801,
+      "shard_step_ms": 6.93245267868042,
+      "full_peak_gb": 1.2200636863708496,
+      "shard_peak_gb": 1.1497511863708496,
+      "full_optimizer_state_gb": 0.2988281846046448,
+      "shard_optimizer_state_local_gb": 0.1582031548023224
+    },
+    {
+      "rank": 1,
+      "full_step_ms": 4.950830936431885,
+      "shard_step_ms": 6.9335527420043945,
+      "full_peak_gb": 1.2024855613708496,
+      "shard_peak_gb": 1.1233839988708496,
+      "full_optimizer_state_gb": 0.2988281846046448,
+      "shard_optimizer_state_local_gb": 0.1406250298023224
+    }
+  ]
+}
